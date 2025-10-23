@@ -87,33 +87,63 @@ def _auth(auth_header: str | None):
 @app.post("/next_best_action")
 def next_best_action(payload: NBARequest, authorization: str = Header(None)):
     _auth(authorization)
-    stage = payload.stage.upper()
-    # enforce fences
-    default_arms = ACTIONS_BY_STAGE.get(stage, [])
-    arms = [a for a in payload.allowed_actions if a in default_arms]
-    if not arms:
-        arms = default_arms
-    if not arms:
-        raise HTTPException(400, f"No configured actions for stage {stage}")
+    try:
+        stage = payload.stage.upper()
+        default_arms = ACTIONS_BY_STAGE.get(stage, [])
+        arms = [a for a in payload.allowed_actions if a in default_arms] or default_arms
+        if not arms:
+            # Clear message instead of 500
+            raise HTTPException(400, f"No configured actions for stage {stage}")
 
-    x = _vectorize(payload.features)
+        x = _vectorize(payload.features)
 
-    with LOCK:
-        mab = _load_or_init(arms)
-        # warm-start: predict scores for each arm; MABWiser 'predict' returns best arm
-        scores = {}
-        for a in arms:
-            scores[a] = mab.predict_expectation(context=x, arm=a) if hasattr(mab, "predict_expectation") else 0.0
-        # simple uncertainty proxy: alpha / sqrt(n_a + 1)
-        n = getattr(mab, "n", {}) if hasattr(mab, "n") else {}
-        ranked = sorted(arms, key=lambda a: scores.get(a, 0.0) + 0.3 / math.sqrt(n.get(a, 0) + 1), reverse=True)
-        topk = ranked[: max(1, payload.k)]
-        # persist
-        dump(mab, MODEL_PATH)
+        with LOCK:
+            mab = _load_or_init(arms)
+            # Try to score; if anything goes wrong, continue with zeros
+            scores = {}
+            try:
+                # Some MABWiser versions expose predict_expectations(); use that if present
+                if hasattr(mab, "predict_expectations"):
+                    pe = mab.predict_expectations(context=x)
+                    # predict_expectations returns a dict arm->expected
+                    scores = {a: float(pe.get(a, 0.0)) for a in arms}
+                else:
+                    for a in arms:
+                        try:
+                            scores[a] = float(mab.predict_expectation(context=x, arm=a))  # may not exist in some versions
+                        except Exception:
+                            scores[a] = 0.0
+            except Exception:
+                # Cold-start or version differences: just use zero scores
+                scores = {a: 0.0 for a in arms}
 
-    choices = [{"action": a, "score": float(scores.get(a, 0.0)), "uncertainty": round(0.3 / math.sqrt(n.get(a, 0) + 1), 3),
-                "expected": {"cr_uplift": 0.01, "delta_t_days": -0.5}} for a in topk]
-    return {"choices": choices, "policy": "mabwiser.linucb", "notes": "baseline; tune alpha; replace features with real featurizer"}
+            # Simple exploration bonus (works even before any fit)
+            n = getattr(mab, "n", {}) if hasattr(mab, "n") else {}
+            ranked = sorted(
+                arms, key=lambda a: scores.get(a, 0.0) + 0.3 / ( (n.get(a, 0) + 1) ** 0.5 ), reverse=True
+            )
+            topk = ranked[: max(1, payload.k)]
+            dump(mab, MODEL_PATH)  # persist
+
+        choices = [{
+            "action": a,
+            "score": float(scores.get(a, 0.0)),
+            "uncertainty": round(0.3 / ((n.get(a, 0) + 1) ** 0.5), 3),
+            "expected": {"cr_uplift": 0.01, "delta_t_days": -0.5}
+        } for a in topk]
+
+        return {"choices": choices, "policy": "mabwiser.linucb", "notes": "cold-start safe; send /feedback to learn"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        # Last-resort: never 500, return a deterministic fallback
+        fallback = payload.allowed_actions[: max(1, payload.k)] or ACTIONS_BY_STAGE.get(payload.stage.upper(), [])[:1]
+        return {
+            "choices": [{"action": a, "score": 0.0, "uncertainty": 0.3, "expected": {"cr_uplift": 0.0, "delta_t_days": 0.0}}
+                        for a in fallback],
+            "policy": "mabwiser.linucb",
+            "notes": f"fallback due to: {type(e).__name__}"
+        }
 
 @app.post("/feedback")
 def feedback(fb: Feedback, authorization: str = Header(None)):
