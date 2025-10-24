@@ -1,32 +1,27 @@
-# main.py — NextBestAction API (FastAPI)
-# - HTTP Bearer security => Swagger Authorize injects header
-# - CORS enabled so /docs "Try it out" works
-# - SAFE MODE (env: NBA_SAFE_MODE=1) to bypass bandit if desired
-# - Never 500: returns fallback with a clear note, logs stack traces
+# main.py — NextBestAction API (FastAPI + MABWiser)
+# Fix: correct call to predict_expectations; no more AttributeError
 
 from __future__ import annotations
-import os, math, threading, logging, traceback
+import os, threading, logging, traceback
 from typing import List, Dict, Any
 
 from fastapi import FastAPI, HTTPException, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from joblib import dump, load
+from mabwiser.mab import MAB, LearningPolicy, NeighborhoodPolicy
 
-# -------- App & CORS --------
-app = FastAPI(title="NextBestAction API", version="1.1.0")
+app = FastAPI(title="NextBestAction API", version="1.0.2")
 
+# --- CORS so Swagger "Try it out" works from the browser ---
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],       # restrict later to your UI origins if you want
-    allow_methods=["*"],
-    allow_headers=["*"],
-    allow_credentials=False    # keep False when origins="*"
+    allow_origins=["*"], allow_methods=["*"], allow_headers=["*"], allow_credentials=False
 )
 
-# -------- Security (Swagger Authorize uses this) --------
+# --- Bearer auth (Swagger's Authorize injects the header) ---
 bearer = HTTPBearer(auto_error=True)
-
 def require_token(creds: HTTPAuthorizationCredentials = Depends(bearer)) -> bool:
     if creds.scheme.lower() != "bearer":
         raise HTTPException(status_code=401, detail="Use Bearer token")
@@ -34,19 +29,14 @@ def require_token(creds: HTTPAuthorizationCredentials = Depends(bearer)) -> bool
         raise HTTPException(status_code=403, detail="Invalid API key")
     return True
 
-# -------- Logging --------
-log = logging.getLogger("nba")
-logging.basicConfig(level=logging.INFO)
+# --- Logging ---
+log = logging.getLogger("nba"); logging.basicConfig(level=logging.INFO)
+def _log_exc(msg: str, e: Exception): log.error("%s: %s\n%s", msg, repr(e), traceback.format_exc())
 
-def _log_exc(msg: str, e: Exception):
-    log.error("%s: %s\n%s", msg, repr(e), traceback.format_exc())
-
-# -------- Config & State --------
+# --- State & config ---
 MODEL_PATH = os.environ.get("NBA_MODEL_PATH", "nba_model.joblib")
-SAFE_MODE  = os.environ.get("NBA_SAFE_MODE", "0") == "1"
 LOCK = threading.Lock()
 
-# Bowtie-stage action fences (edit these to your liking)
 ACTIONS_BY_STAGE: Dict[str, List[str]] = {
     "AWR": ["invite","prep","follow_up_t2","discovery_invite"],
     "EDU": ["diagnose_spiced","impact_calc","case_study_send"],
@@ -58,46 +48,40 @@ ACTIONS_BY_STAGE: Dict[str, List[str]] = {
     "ADV": ["case_brief","webinar_invite","reference_call"]
 }
 
-# -------- Minimal featurizer --------
-def _vectorize(features: Dict[str, Any]) -> List[float]:
-    vec: List[float] = []
-    for k in sorted(features.keys()):
-        v = features[k]
-        if isinstance(v, (int, float)): vec.append(float(v))
-        elif isinstance(v, bool):       vec.append(1.0 if v else 0.0)
-        else:                           vec.append((abs(hash(str(v))) % 1000) / 1000.0)
-    return vec
-
-# -------- Bandit engine (lazy import + safe fallback) --------
-def _new_mab(arms: List[str]):
-    # Import lazily so the module never crashes app startup
-    from mabwiser.mab import MAB, LearningPolicy, NeighborhoodPolicy
+def _new_model(arms: List[str]) -> MAB:
     return MAB(
         arms=arms,
         learning_policy=LearningPolicy.LinUCB(alpha=0.3),
         neighborhood_policy=NeighborhoodPolicy.KNN(k=0)
     )
 
-def _load_or_init(arms: List[str]):
+def _load_or_init(arms: List[str]) -> MAB:
     try:
         if os.path.exists(MODEL_PATH):
-            from joblib import load
-            m = load(MODEL_PATH)
+            m: MAB = load(MODEL_PATH)
             if set(getattr(m, "arms", [])) != set(arms):
-                m = _new_mab(arms)
+                m = _new_model(arms)
             return m
     except Exception as e:
         _log_exc("model load failed; reinit", e)
-    return _new_mab(arms)
+    return _new_model(arms)
 
-def _persist(m):
+def _persist(m: MAB):
     try:
-        from joblib import dump
         dump(m, MODEL_PATH)
     except Exception as e:
         _log_exc("model save failed (continuing)", e)
 
-# -------- Schemas --------
+def _vectorize(features: Dict[str, Any]) -> List[float]:
+    vec: List[float] = []
+    for k in sorted(features.keys()):
+        v = features[k]
+        if isinstance(v, (int, float)): vec.append(float(v))
+        elif isinstance(v, bool):        vec.append(1.0 if v else 0.0)
+        else:                             vec.append((abs(hash(str(v))) % 1000) / 1000.0)
+    return vec
+
+# --- Schemas ---
 class NBARequest(BaseModel):
     run_id: str
     account_id: str
@@ -116,10 +100,10 @@ class Feedback(BaseModel):
     reward: float
     context: Dict[str, Any]
 
-# -------- Routes --------
+# --- Routes ---
 @app.get("/")
 def health():
-    return {"ok": True, "service": "NextBestAction API", "safe_mode": SAFE_MODE}
+    return {"ok": True, "service": "NextBestAction API"}
 
 @app.post("/next_best_action", dependencies=[Depends(require_token)])
 def next_best_action(payload: NBARequest):
@@ -130,44 +114,32 @@ def next_best_action(payload: NBARequest):
         if not arms:
             raise HTTPException(status_code=400, detail=f"No configured actions for stage {stage}")
 
-        # SAFE MODE: simple heuristic ranking (no MAB), always works
-        if SAFE_MODE:
-            x = _vectorize(payload.features)
-            # trivial heuristic: prefer earlier actions; add tiny boost if “gap” or “map”
-            scored = []
-            for a in arms:
-                base = 0.0
-                if "gap" in a: base += 0.05
-                if "map" in a: base += 0.03
-                base += 0.001 * sum(x)
-                scored.append((a, base))
-            ranked = [a for a, _ in sorted(scored, key=lambda t: t[1], reverse=True)]
-            topk = ranked[: max(1, payload.k)]
-            return {
-                "choices": [{"action": a, "score": 0.0, "uncertainty": 0.3,
-                             "expected": {"cr_uplift": 0.0, "delta_t_days": 0.0}} for a in topk],
-                "policy": "safe",
-                "notes": "SAFE MODE (NBA_SAFE_MODE=1)"
-            }
-
-        # Normal bandit path (LinUCB)
         x = _vectorize(payload.features)
+
         with LOCK:
             mab = _load_or_init(arms)
-            # score expectations defensively
-            scores = {a: 0.0 for a in arms}
-            try:
-                if hasattr(mab, "predict_expectations"):
-                    pe = mab.predict_expectations(context=x)
-                    for a in arms: scores[a] = float(pe.get(a, 0.0))
-                else:
-                    for a in arms:
-                        try:    scores[a] = float(mab.predict_expectation(context=x, arm=a))
-                        except: scores[a] = 0.0
-            except Exception as e:
-                _log_exc("scoring failed; zeros used", e)
-                scores = {a: 0.0 for a in arms}
 
+            # ---- Correct call: 'contexts' positional/keyword accepted; handle dict vs list-of-dicts ----
+            scores: Dict[str, float] = {a: 0.0 for a in arms}
+            try:
+                pe = None
+                if hasattr(mab, "predict_expectations"):
+                    # MABWiser API: predict_expectations(contexts) returns Dict for 1 context, List[Dict] for many
+                    pe = mab.predict_expectations(x)  # pass 1-D list (single context)  ✅
+                    if isinstance(pe, list) and len(pe) > 0:
+                        pe = pe[0]
+                    if isinstance(pe, dict):
+                        for a in arms:
+                            scores[a] = float(pe.get(a, 0.0))
+                else:
+                    # Fallback to best-arm then zero scores (rare)
+                    best = mab.predict(x) if hasattr(mab, "predict") else None
+                    if best in arms:
+                        scores[best] = 1.0
+            except Exception as e:
+                _log_exc("scoring failed; using zeros", e)
+
+            # simple exploration bonus even before any training
             n = getattr(mab, "n", {}) if hasattr(mab, "n") else {}
             ranked = sorted(arms, key=lambda a: scores.get(a, 0.0) + 0.3 / ((n.get(a, 0) + 1) ** 0.5), reverse=True)
             topk = ranked[: max(1, payload.k)]
@@ -198,24 +170,22 @@ def feedback(fb: Feedback):
     try:
         stage = (fb.stage or "").upper()
         arms = ACTIONS_BY_STAGE.get(stage, [])
-        if fb.action not in arms: arms.append(fb.action)
-
-        # SAFE MODE: accept & return ok (no learning)
-        if SAFE_MODE:
-            return {"ok": True, "notes": "SAFE MODE; no learning"}
+        if fb.action not in arms:
+            arms.append(fb.action)
 
         x = _vectorize(fb.context)
 
         with LOCK:
             mab = _load_or_init(arms)
             try:
+                # MABWiser supports online learning via partial_fit(decisions, rewards, contexts) ✅
                 if hasattr(mab, "partial_fit"):
                     mab.partial_fit(decisions=[fb.action], rewards=[fb.reward], contexts=[x])
                 else:
                     mab.fit(decisions=[fb.action], rewards=[fb.reward], contexts=[x])
             except Exception as e:
                 _log_exc("fit failed; reinit once", e)
-                mab = _new_mab(arms)
+                mab = _new_model(arms)
                 mab.fit(decisions=[fb.action], rewards=[fb.reward], contexts=[x])
             _persist(mab)
 
